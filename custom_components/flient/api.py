@@ -21,6 +21,7 @@ against a live authenticated session yet.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from typing import Any
@@ -147,7 +148,9 @@ class FlientApi:
         """
         self._session = session
         self._email = email
-        self._password = password
+        # The API authenticates with an MD5 hash of the password, not the
+        # plaintext (confirmed against the live /sendOTP endpoint).
+        self._password_hash = hashlib.md5(password.encode("utf-8")).hexdigest()
         self._user_id = user_id
         self._access_token = access_token
         self._refresh_token = refresh_token
@@ -179,7 +182,7 @@ class FlientApi:
         """
         body: dict[str, Any] = {
             "email_or_phone": self._email,
-            "password": self._password,
+            "password": self._password_hash,
         }
         if otp:
             body["otp"] = otp
@@ -212,7 +215,7 @@ class FlientApi:
         """
         body = {
             "email_or_phone": self._email,
-            "password": self._password,
+            "password": self._password_hash,
             "type": "login",
         }
         payload = await self._raw_request(
