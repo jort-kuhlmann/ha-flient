@@ -79,6 +79,12 @@ class FlientConfigFlow(ConfigFlow, domain=DOMAIN):
         try:
             await api.async_login(otp=otp)
         except FlientOtpRequired:
+            # First login attempt: the account has 2FA. Ask the server to send
+            # the code, then show the OTP step.
+            try:
+                await api.async_send_otp()
+            except FlientApiError:
+                _LOGGER.warning("Flient sendOTP request failed; code may not arrive")
             return self.async_show_form(
                 step_id="otp", data_schema=STEP_OTP_DATA_SCHEMA, errors=errors
             )

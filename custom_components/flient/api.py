@@ -36,6 +36,7 @@ from .const import (
     ENDPOINT_LOGIN,
     ENDPOINT_RECORDS,
     ENDPOINT_REFRESH,
+    ENDPOINT_SEND_OTP,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -168,12 +169,13 @@ class FlientApi:
         """Perform a full email/password (optionally + OTP) login.
 
         ``POST /login`` with ``{email_or_phone, password, otp?}``. When 2FA is
-        enabled the first call (no otp) responds with "Please enter otp" and the
-        server emails/texts a code; the code is then submitted on a second call.
-        Raises :class:`FlientOtpRequired` in that case.
+        enabled the first call (no otp) is rejected asking for the code; the
+        caller must then trigger :meth:`async_send_otp` to have the server send
+        it, and submit the code on a second call. Raises
+        :class:`FlientOtpRequired` only when no otp was supplied.
 
-        The identifier field name ``email_or_phone`` and the ``otp`` field name
-        were confirmed by probing the server's validation messages.
+        The identifier field ``email_or_phone`` and the ``otp`` field were
+        confirmed from the decompiled app and the server's validation messages.
         """
         body: dict[str, Any] = {
             "email_or_phone": self._email,
@@ -186,7 +188,10 @@ class FlientApi:
 
         if not _result_ok(payload):
             msg = _message(payload)
-            if "otp" in msg.lower() or "code" in msg.lower():
+            # Only route to the OTP step when we haven't already supplied one;
+            # otherwise a wrong/expired code (message often contains "otp") is a
+            # genuine auth failure, not a prompt to re-enter.
+            if otp is None and ("otp" in msg.lower() or "code" in msg.lower()):
                 raise FlientOtpRequired(msg)
             raise FlientAuthError(msg)
 
@@ -194,6 +199,28 @@ class FlientApi:
         if not self._access_token:
             raise FlientAuthError("Login succeeded but no access token was returned")
         return {"user_id": self._user_id}
+
+    async def async_send_otp(self) -> None:
+        """Ask the server to send a login OTP to the account.
+
+        ``POST /sendOTP`` with ``{email, emailOrPhone, phoneNo, password,
+        type}`` and ``type="login"`` (from the decompiled login flow). The app
+        sends this as multipart; the Laravel backend also reads JSON. Best
+        effort: a non-success envelope is logged, not raised, so the user can
+        still enter a code (or retry) if delivery is merely delayed.
+        """
+        body = {
+            "email": self._email,
+            "emailOrPhone": self._email,
+            "phoneNo": "",
+            "password": self._password,
+            "type": "login",
+        }
+        payload = await self._raw_request(
+            "POST", ENDPOINT_SEND_OTP, json=body, auth=False
+        )
+        if not _result_ok(payload):
+            _LOGGER.debug("sendOTP did not report success: %s", _message(payload))
 
     async def _store_tokens(self, data: dict[str, Any]) -> None:
         """Extract and persist tokens from a login/refresh data body."""
