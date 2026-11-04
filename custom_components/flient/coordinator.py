@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import FlientApi, FlientApiError, FlientAuthError
@@ -26,41 +27,33 @@ class FlientCoordinator(DataUpdateCoordinator[dict[int, dict[str, Any]]]):
             update_interval=timedelta(seconds=SCAN_INTERVAL_SECONDS),
         )
         self.api = api
-        self._initial_load = True
+        self._locks_loaded = False
 
     async def _async_update_data(self) -> dict[int, dict[str, Any]]:
-        """Fetch lock data. First call loads list, subsequent calls poll events."""
+        """Fetch the lock list once, then poll per-lock state each cycle."""
         try:
-            if self._initial_load or not self.data:
-                # First load: get lock list
-                locks = await self.api.get_locks()
-                lock_data: dict[int, dict[str, Any]] = {}
-                for lock in locks:
+            data: dict[int, dict[str, Any]] = dict(self.data or {})
+
+            if not self._locks_loaded or not data:
+                data = {}
+                for lock in await self.api.get_locks():
                     lock_id = lock.get("lock_id")
                     if lock_id is None:
                         continue
-                    lock_data[lock_id] = lock
-                self._initial_load = False
-                return lock_data
+                    data[lock_id] = lock
+                self._locks_loaded = True
 
-            # Subsequent calls: check for recent events
-            events = await self.api.get_events(since=SCAN_INTERVAL_SECONDS + 10)
-            if events:
-                for event in events:
-                    lock_id = event.get("lock_id")
-                    if lock_id and lock_id in self.data:
-                        event_type = event.get("event_type")
-                        if event_type == "lock":
-                            self.data[lock_id]["state"] = 0
-                        elif event_type == "unlock":
-                            self.data[lock_id]["state"] = 1
-                        self.data[lock_id]["last_method"] = event.get("method", "")
-                        self.data[lock_id]["last_event_time"] = event.get("timestamp", "")
+            # Poll current state + battery for each known lock.
+            for lock_id in list(data):
+                state = await self.api.get_lock_state(lock_id)
+                if state:
+                    data[lock_id].update(state)
 
-            return self.data
+            return data
 
         except FlientAuthError as err:
-            raise UpdateFailed(f"Authentication error: {err}") from err
+            # Token unrecoverable (e.g. 2FA re-login needed): trigger HA reauth.
+            raise ConfigEntryAuthFailed(str(err)) from err
         except FlientApiError as err:
             raise UpdateFailed(f"Error communicating with Flient API: {err}") from err
 

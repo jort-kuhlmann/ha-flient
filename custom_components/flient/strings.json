@@ -8,6 +8,13 @@
           "email": "E-mailadres",
           "password": "Wachtwoord"
         }
+      },
+      "otp": {
+        "title": "Verificatiecode",
+        "description": "Voer de verificatiecode (OTP) in die je per e-mail of sms hebt ontvangen.",
+        "data": {
+          "otp": "Verificatiecode"
+        }
       }
     },
     "error": {

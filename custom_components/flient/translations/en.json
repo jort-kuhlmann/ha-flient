@@ -8,6 +8,13 @@
           "email": "Email address",
           "password": "Password"
         }
+      },
+      "otp": {
+        "title": "Verification code",
+        "description": "Enter the verification code (OTP) sent to you by email or SMS.",
+        "data": {
+          "otp": "Verification code"
+        }
       }
     },
     "error": {

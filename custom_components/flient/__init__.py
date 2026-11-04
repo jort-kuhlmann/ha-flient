@@ -9,7 +9,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import FlientApi
-from .const import DOMAIN
+from .const import (
+    CONF_ACCESS_TOKEN,
+    CONF_REFRESH_TOKEN,
+    CONF_USER_ID,
+    DOMAIN,
+)
 from .coordinator import FlientCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -20,11 +25,26 @@ PLATFORMS: list[Platform] = [Platform.LOCK, Platform.SENSOR]
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Flient from a config entry."""
     session = async_get_clientsession(hass)
+
+    async def _persist_tokens(access_token: str | None, refresh_token: str | None) -> None:
+        """Save refreshed tokens back to the config entry."""
+        hass.config_entries.async_update_entry(
+            entry,
+            data={
+                **entry.data,
+                CONF_ACCESS_TOKEN: access_token,
+                CONF_REFRESH_TOKEN: refresh_token,
+            },
+        )
+
     api = FlientApi(
         session,
         email=entry.data[CONF_EMAIL],
         password=entry.data[CONF_PASSWORD],
-        user_id=entry.data.get("user_id"),
+        user_id=entry.data.get(CONF_USER_ID),
+        access_token=entry.data.get(CONF_ACCESS_TOKEN),
+        refresh_token=entry.data.get(CONF_REFRESH_TOKEN),
+        token_updated_cb=_persist_tokens,
     )
 
     coordinator = FlientCoordinator(hass, api)
