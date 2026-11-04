@@ -20,14 +20,23 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-STEP_USER_DATA_SCHEMA = vol.Schema(
+STEP_CREDENTIALS_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_EMAIL): str,
         vol.Required(CONF_PASSWORD): str,
     }
 )
 
-STEP_OTP_DATA_SCHEMA = vol.Schema({vol.Required("otp"): str})
+STEP_OTP_SCHEMA = vol.Schema({vol.Required("otp"): str})
+
+STEP_TOKEN_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_USER_ID): str,
+        vol.Required(CONF_ACCESS_TOKEN): str,
+        vol.Required(CONF_REFRESH_TOKEN): str,
+        vol.Optional(CONF_EMAIL, default=""): str,
+    }
+)
 
 
 class FlientConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -43,16 +52,23 @@ class FlientConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle the initial (email/password) step."""
-        errors: dict[str, str] = {}
+        """Let the user pick how to authenticate."""
+        return self.async_show_menu(
+            step_id="user", menu_options=["credentials", "token"]
+        )
 
+    async def async_step_credentials(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle the email/password step."""
+        errors: dict[str, str] = {}
         if user_input is not None:
             self._email = user_input[CONF_EMAIL]
             self._password = user_input[CONF_PASSWORD]
             return await self._attempt_login(errors)
 
         return self.async_show_form(
-            step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
+            step_id="credentials", data_schema=STEP_CREDENTIALS_SCHEMA, errors=errors
         )
 
     async def async_step_otp(
@@ -60,12 +76,51 @@ class FlientConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Handle the OTP (2FA) step."""
         errors: dict[str, str] = {}
-
         if user_input is not None:
             return await self._attempt_login(errors, otp=user_input["otp"])
 
         return self.async_show_form(
-            step_id="otp", data_schema=STEP_OTP_DATA_SCHEMA, errors=errors
+            step_id="otp", data_schema=STEP_OTP_SCHEMA, errors=errors
+        )
+
+    async def async_step_token(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Set up directly from existing tokens (skips email/OTP)."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            session = async_get_clientsession(self.hass)
+            api = FlientApi(
+                session,
+                email=user_input.get(CONF_EMAIL, ""),
+                password="",
+                user_id=user_input[CONF_USER_ID],
+                access_token=user_input[CONF_ACCESS_TOKEN],
+                refresh_token=user_input[CONF_REFRESH_TOKEN],
+            )
+            try:
+                await api.get_locks()  # validates the token
+            except FlientAuthError:
+                errors["base"] = "invalid_auth"
+            except FlientApiError:
+                errors["base"] = "cannot_connect"
+            else:
+                await self.async_set_unique_id(str(user_input[CONF_USER_ID]))
+                self._abort_if_unique_id_configured()
+                return self.async_create_entry(
+                    title="Flient Smart Lock",
+                    data={
+                        CONF_EMAIL: user_input.get(CONF_EMAIL, ""),
+                        CONF_PASSWORD: "",
+                        CONF_USER_ID: user_input[CONF_USER_ID],
+                        CONF_ACCESS_TOKEN: user_input[CONF_ACCESS_TOKEN],
+                        CONF_REFRESH_TOKEN: user_input[CONF_REFRESH_TOKEN],
+                    },
+                )
+
+        return self.async_show_form(
+            step_id="token", data_schema=STEP_TOKEN_SCHEMA, errors=errors
         )
 
     async def _attempt_login(
@@ -86,7 +141,7 @@ class FlientConfigFlow(ConfigFlow, domain=DOMAIN):
             except FlientApiError:
                 _LOGGER.warning("Flient sendOTP request failed; code may not arrive")
             return self.async_show_form(
-                step_id="otp", data_schema=STEP_OTP_DATA_SCHEMA, errors=errors
+                step_id="otp", data_schema=STEP_OTP_SCHEMA, errors=errors
             )
         except FlientAuthError:
             errors["base"] = "invalid_auth"
@@ -114,8 +169,8 @@ class FlientConfigFlow(ConfigFlow, domain=DOMAIN):
         # On error, re-show the step we came from.
         if otp is not None:
             return self.async_show_form(
-                step_id="otp", data_schema=STEP_OTP_DATA_SCHEMA, errors=errors
+                step_id="otp", data_schema=STEP_OTP_SCHEMA, errors=errors
             )
         return self.async_show_form(
-            step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
+            step_id="credentials", data_schema=STEP_CREDENTIALS_SCHEMA, errors=errors
         )

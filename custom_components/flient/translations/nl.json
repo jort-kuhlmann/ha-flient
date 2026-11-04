@@ -3,6 +3,14 @@
     "step": {
       "user": {
         "title": "Flient Smart Lock",
+        "description": "Kies hoe je wilt inloggen.",
+        "menu_options": {
+          "credentials": "Inloggen met e-mail en wachtwoord",
+          "token": "Bestaande tokens gebruiken (geavanceerd)"
+        }
+      },
+      "credentials": {
+        "title": "Flient Smart Lock",
         "description": "Log in met je Flient account.",
         "data": {
           "email": "E-mailadres",
@@ -15,11 +23,21 @@
         "data": {
           "otp": "Verificatiecode"
         }
+      },
+      "token": {
+        "title": "Bestaande tokens",
+        "description": "Voer de tokens in om in te loggen zonder verificatiecode.",
+        "data": {
+          "user_id": "Gebruikers-ID",
+          "access_token": "Token",
+          "refresh_token": "Refresh token",
+          "email": "E-mailadres (optioneel)"
+        }
       }
     },
     "error": {
       "cannot_connect": "Kan geen verbinding maken met Flient",
-      "invalid_auth": "Ongeldig e-mailadres of wachtwoord",
+      "invalid_auth": "Ongeldige inloggegevens of tokens",
       "unknown": "Onbekende fout"
     },
     "abort": {

@@ -39,8 +39,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     api = FlientApi(
         session,
-        email=entry.data[CONF_EMAIL],
-        password=entry.data[CONF_PASSWORD],
+        email=entry.data.get(CONF_EMAIL, ""),
+        password=entry.data.get(CONF_PASSWORD, ""),
         user_id=entry.data.get(CONF_USER_ID),
         access_token=entry.data.get(CONF_ACCESS_TOKEN),
         refresh_token=entry.data.get(CONF_REFRESH_TOKEN),
