@@ -88,6 +88,36 @@ def _data(payload: dict[str, Any]) -> Any:
     return _first(payload, "data", "Data", "Result") or {}
 
 
+# Keys whose values must never reach the log (credentials/tokens/OTP).
+_SENSITIVE_KEYS = frozenset(
+    {
+        "password",
+        "access_token",
+        "accesstoken",
+        "refresh_token",
+        "refreshtoken",
+        "token",
+        "authorization",
+        "otp",
+        "otpcode",
+        "verifycode",
+        "verificationcode",
+    }
+)
+
+
+def _redact(value: Any) -> Any:
+    """Recursively copy a JSON-ish structure, masking sensitive values."""
+    if isinstance(value, dict):
+        return {
+            key: ("***" if key.lower() in _SENSITIVE_KEYS else _redact(val))
+            for key, val in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact(item) for item in value]
+    return value
+
+
 class FlientApi:
     """Client for the Flient (TTLock white-label) API."""
 
@@ -372,6 +402,15 @@ class FlientApi:
         if auth and self._access_token:
             headers["Authorization"] = f"Bearer {self._access_token}"
 
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug(
+                "Flient request %s %s body=%s auth=%s",
+                method,
+                endpoint,
+                _redact(json) if json else None,
+                auth and bool(self._access_token),
+            )
+
         try:
             async with self._session.request(
                 method,
@@ -380,12 +419,28 @@ class FlientApi:
                 json=json if method == "POST" else None,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
-                if resp.status in (401, 403):
-                    raise FlientAuthError("Authentication expired")
-                resp.raise_for_status()
-                payload = await resp.json(content_type=None)
+                status = resp.status
+                try:
+                    payload = await resp.json(content_type=None)
+                except (ValueError, aiohttp.ContentTypeError) as err:
+                    text = await resp.text()
+                    raise FlientApiError(
+                        f"Non-JSON response (HTTP {status}): {text[:200]}"
+                    ) from err
         except aiohttp.ClientError as err:
             raise FlientApiError(f"API request failed: {err}") from err
+
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug(
+                "Flient response %s %s -> HTTP %s body=%s",
+                method,
+                endpoint,
+                status,
+                _redact(payload) if isinstance(payload, (dict, list)) else payload,
+            )
+
+        if status in (401, 403):
+            raise FlientAuthError("Authentication expired")
 
         if not isinstance(payload, dict):
             raise FlientApiError(f"Unexpected response: {payload!r}")
