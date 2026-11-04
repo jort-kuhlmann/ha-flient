@@ -160,15 +160,19 @@ class FlientApi:
     async def async_login(self, otp: str | None = None) -> dict[str, Any]:
         """Perform a full email/password (optionally + OTP) login.
 
-        ASSUMPTION: ``POST /login`` with ``{email, password, otp?}``. When 2FA
-        is enabled the server first responds with a message containing "otp"
-        (observed: ``"Please enter otp"``); the OTP is then submitted on a
-        second call. Raises :class:`FlientOtpRequired` in that case.
+        ``POST /login`` with ``{email_or_phone, password, otp?}``. When 2FA is
+        enabled the first call (no otp) responds with "Please enter otp" and the
+        server emails/texts a code; the code is then submitted on a second call.
+        Raises :class:`FlientOtpRequired` in that case.
+
+        The identifier field name ``email_or_phone`` and the ``otp`` field name
+        were confirmed by probing the server's validation messages.
         """
-        body: dict[str, Any] = {"email": self._email, "password": self._password}
+        body: dict[str, Any] = {
+            "email_or_phone": self._email,
+            "password": self._password,
+        }
         if otp:
-            # ASSUMPTION: field name. Alternatives seen in the app: otpCode,
-            # verifyCode, verificationCode.
             body["otp"] = otp
 
         payload = await self._raw_request("POST", ENDPOINT_LOGIN, json=body, auth=False)
