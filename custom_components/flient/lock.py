@@ -5,7 +5,7 @@ import asyncio
 import logging
 from typing import Any
 
-from homeassistant.components.lock import LockEntity, LockEntityFeature
+from homeassistant.components.lock import LockEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -16,6 +16,14 @@ from .coordinator import FlientCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
+# State convention: 0 = locked, 1 = unlocked, 2 = unknown.
+STATE_LOCKED = 0
+STATE_UNLOCKED = 1
+
+# Seconds to wait after a command before confirming the real state (the hub
+# relays the command to the lock over the air, which takes a moment).
+_CONFIRM_DELAY = 3
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -24,19 +32,17 @@ async def async_setup_entry(
 ) -> None:
     """Set up Flient locks from a config entry."""
     coordinator: FlientCoordinator = hass.data[DOMAIN][entry.entry_id]
-
-    entities = [
+    async_add_entities(
         FlientLock(coordinator, lock_id, lock_data)
         for lock_id, lock_data in coordinator.data.items()
-    ]
-
-    async_add_entities(entities)
+    )
 
 
 class FlientLock(CoordinatorEntity[FlientCoordinator], LockEntity):
     """Representation of a Flient Smart Lock."""
 
     _attr_has_entity_name = True
+    _attr_name = None  # the device name is the lock name
 
     def __init__(
         self,
@@ -48,10 +54,8 @@ class FlientLock(CoordinatorEntity[FlientCoordinator], LockEntity):
         super().__init__(coordinator)
         self._lock_id = lock_id
         self._attr_unique_id = f"flient_lock_{lock_id}"
-        self._attr_name = lock_data.get("lock_name", f"Lock {lock_id}")
-        self._attr_is_locked = True  # Default to locked
-        self._is_locking = False
-        self._is_unlocking = False
+        self._attr_is_locking = False
+        self._attr_is_unlocking = False
 
     @property
     def device_info(self) -> dict[str, Any]:
@@ -66,77 +70,60 @@ class FlientLock(CoordinatorEntity[FlientCoordinator], LockEntity):
 
     @property
     def is_locked(self) -> bool | None:
-        """Return true if the lock is locked."""
-        lock_data = self.coordinator.data.get(self._lock_id, {})
-        state = lock_data.get("state")
-        if state is not None:
-            # Flient API: 0 = locked, 1 = unlocked, 2 = unknown
-            if state == 2:
-                return self._attr_is_locked
-            return state == 0
-        return self._attr_is_locked
+        """Return true if locked, false if unlocked, None if unknown."""
+        state = self.coordinator.data.get(self._lock_id, {}).get("state")
+        if state == STATE_LOCKED:
+            return True
+        if state == STATE_UNLOCKED:
+            return False
+        return None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return extra state attributes."""
         lock_data = self.coordinator.data.get(self._lock_id, {})
-        attrs = {}
-        auto_lock = lock_data.get("auto_lock_time")
-        if auto_lock is not None:
-            attrs["auto_lock_time"] = auto_lock
-            attrs["auto_lock_enabled"] = auto_lock > 0
+        attrs: dict[str, Any] = {}
+        if (mac := lock_data.get("mac")) is not None:
+            attrs["mac"] = mac
+        if (door := lock_data.get("door_state")) is not None:
+            attrs["door_state"] = door
         return attrs
-
-    @property
-    def is_locking(self) -> bool:
-        """Return true if the lock is locking."""
-        return self._is_locking
-
-    @property
-    def is_unlocking(self) -> bool:
-        """Return true if the lock is unlocking."""
-        return self._is_unlocking
 
     async def async_lock(self, **kwargs: Any) -> None:
         """Lock the device."""
-        self._is_locking = True
-        self.async_write_ha_state()
-
-        success = await self.coordinator.api.lock(self._lock_id)
-
-        self._is_locking = False
-        if success:
-            self._attr_is_locked = True
-
-        self.async_write_ha_state()
+        await self._run_action(STATE_LOCKED)
 
     async def async_unlock(self, **kwargs: Any) -> None:
         """Unlock the device."""
-        self._is_unlocking = True
+        await self._run_action(STATE_UNLOCKED)
+
+    async def _run_action(self, target: int) -> None:
+        """Send a lock/unlock command, update optimistically, then confirm."""
+        self._attr_is_locking = target == STATE_LOCKED
+        self._attr_is_unlocking = target == STATE_UNLOCKED
         self.async_write_ha_state()
 
-        success = await self.coordinator.api.unlock(self._lock_id)
+        try:
+            if target == STATE_LOCKED:
+                ok = await self.coordinator.api.lock(self._lock_id)
+            else:
+                ok = await self.coordinator.api.unlock(self._lock_id)
+        finally:
+            self._attr_is_locking = False
+            self._attr_is_unlocking = False
 
-        self._is_unlocking = False
-        if success:
-            self._attr_is_locked = False
-            self.async_write_ha_state()
-
-            # Fetch fresh state to get auto_lock_time, then schedule re-lock
-            state = await self.coordinator.async_refresh_lock_state(self._lock_id)
-            auto_lock = state.get("auto_lock_time", 0)
-            if auto_lock and int(auto_lock) > 0:
-                _LOGGER.debug("Auto-lock in %s+2 seconds for lock %s", auto_lock, self._lock_id)
-                self.hass.async_create_task(self._auto_lock_refresh(int(auto_lock) + 2))
-        else:
-            self.async_write_ha_state()
-
-    async def _auto_lock_refresh(self, delay: int) -> None:
-        """Refresh state after auto-lock delay."""
-        await asyncio.sleep(delay)
-        self._attr_is_locked = True
+        if ok and self._lock_id in self.coordinator.data:
+            # Optimistic: reflect the requested state immediately in the UI.
+            self.coordinator.data[self._lock_id]["state"] = target
         self.async_write_ha_state()
-        # Also verify with API
+
+        if ok:
+            # Confirm the real state shortly after (getOpenStateLock is live).
+            self.hass.async_create_task(self._confirm_state())
+
+    async def _confirm_state(self) -> None:
+        """Re-read the real lock state after the hub has acted."""
+        await asyncio.sleep(_CONFIRM_DELAY)
         await self.coordinator.async_refresh_lock_state(self._lock_id)
         self.async_write_ha_state()
 

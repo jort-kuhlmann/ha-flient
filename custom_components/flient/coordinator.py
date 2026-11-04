@@ -30,16 +30,26 @@ class FlientCoordinator(DataUpdateCoordinator[dict[int, dict[str, Any]]]):
         self._locks_loaded = False
 
     async def _async_update_data(self) -> dict[int, dict[str, Any]]:
-        """Refresh all locks each cycle (state + battery come from getLockList)."""
+        """Refresh all locks each cycle.
+
+        getLockList gives metadata + battery, but its ``lock_state`` lags badly
+        (its updated-at timestamp can be minutes old), so the authoritative
+        open/closed state is taken from getOpenStateLock per lock.
+        """
         try:
-            # getLockList returns lock_state and battery_percentage for every
-            # lock in one call, so refresh the whole set each cycle.
             data: dict[int, dict[str, Any]] = {}
             for lock in await self.api.get_locks():
                 lock_id = lock.get("lock_id")
                 if lock_id is None:
                     continue
                 data[lock_id] = lock
+
+            # Override the stale list state with the live per-lock state.
+            for lock_id in data:
+                live = await self.api.get_lock_state(lock_id)
+                if "state" in live:
+                    data[lock_id]["state"] = live["state"]
+
             self._locks_loaded = True
             return data
 
