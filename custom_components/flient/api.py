@@ -1,23 +1,29 @@
 """Flient API client for Home Assistant.
 
 The Flient backend is a white-label of the TTLock/Sciener cloud, reached at
-``https://api.flient.net/api`` (a Laravel app). The routes and request field
-names were recovered by decompiling the Flient mobile app (Flutter release AOT,
-via Blutter) and cross-checked against the server's validation responses:
+``https://api.flient.net/api`` (a Laravel app). Routes, field names and the
+auth scheme were recovered by decompiling the Flient app (Flutter release AOT,
+via Blutter) and verified against a live account:
 
-- login:              POST /login  {email_or_phone, password, otp}
-- token refresh:      POST /refreshToken  {refresh_token}
+- send OTP:           POST /sendOTP     {email_or_phone, password, type:"login"}
+- login:              POST /login       {email_or_phone, password, otp}
+- token refresh:      POST /refreshToken {user_id, refresh_token}  (+ bearer)
 - list locks:         POST /getLockList  {user_id}
-- lock state:         POST /getOpenStateLock  {user_id, lock_id}
-- battery:            POST /lock/queryElectricQuantity  {user_id, lock_id}
-- records:            POST /getLockRecordList  {user_id, lock_id, page}
-- lock/unlock (hub):  POST /gatewayLockUnlock  {user_id, lock_id, type}
+- lock state:         POST /getOpenStateLock {user_id, lock_id} -> data = state
+- records:            POST /getLockRecordList {user_id, lock_id, page}
+- lock/unlock (hub):  POST /gatewayLockUnlock {user_id, lock_id, type}
                       where type is "lock" | "unlock"
 
-Tokens come back as access_token/accessToken + refresh_token. Responses use a
-{ResponseCode, ResponseMsg, Result, data} envelope. Parsing stays defensive
-(accepts field-name variants) since the response bodies have not all been seen
-against a live authenticated session yet.
+Auth notes (verified):
+- The password is sent as its MD5 hex digest, not plaintext.
+- Login returns many fields; the bearer for ``Authorization: Bearer`` is the
+  ``token`` field (distinct from the ``access_token``/``refresh_token`` pair).
+- Battery and lock_state come from /getLockList (battery_percentage,
+  lock_state); there is no working per-lock battery endpoint.
+
+Responses use a {ResponseCode, ResponseMsg, Result, data} envelope. Parsing
+stays defensive (accepts field-name variants). Lock/unlock request shape is
+confirmed from the decompile but not yet exercised against a physical lock.
 """
 from __future__ import annotations
 
@@ -30,7 +36,6 @@ import aiohttp
 
 from .const import (
     API_BASE_URL,
-    ENDPOINT_BATTERY,
     ENDPOINT_GATEWAY_UNLOCK,
     ENDPOINT_LOCK_LIST,
     ENDPOINT_LOCK_STATE,
@@ -225,33 +230,33 @@ class FlientApi:
             _LOGGER.debug("sendOTP did not report success: %s", _message(payload))
 
     async def _store_tokens(self, data: dict[str, Any]) -> None:
-        """Extract and persist tokens from a login/refresh data body."""
+        """Extract and persist tokens from a login/refresh data body.
+
+        The bearer sent in ``Authorization: Bearer`` is the ``token`` field
+        (the app's interceptor reads ``UserData.token``), which is distinct from
+        the ``access_token``/``refresh_token`` pair also present in the response.
+        """
         if not isinstance(data, dict):
             return
-        self._access_token = _first(data, "access_token", "accessToken") or self._access_token
+        self._access_token = _first(data, "token", "access_token", "accessToken") or self._access_token
         self._refresh_token = (
             _first(data, "refresh_token", "refreshToken") or self._refresh_token
         )
-        self._user_id = _first(data, "user_id", "userId", "uid") or self._user_id
+        self._user_id = _first(data, "user_id", "userId", "uid", "id") or self._user_id
 
-        # ASSUMPTION: an expiry hint may come back as seconds-to-live
-        # (expires_in) or an absolute timestamp (Expire/expireTime). Unknown
-        # TTL is left at 0, in which case we refresh reactively on 401/433.
-        ttl = _first(data, "expires_in", "expiresIn")
-        if ttl:
-            try:
-                self._expires_at = time.time() + int(ttl)
-            except (TypeError, ValueError):
-                self._expires_at = 0.0
+        # Token expiry: the login body carries token_expiry/token_expiry_datetime
+        # in an unconfirmed unit, so we don't trust it for proactive refresh.
+        # Refresh happens reactively when a call returns 401/403/433.
+        self._expires_at = 0.0
 
         if self._token_updated_cb is not None:
             await self._token_updated_cb(self._access_token, self._refresh_token)
 
     async def _async_refresh(self) -> bool:
-        """Try to refresh the access token. Returns True on success.
+        """Try to refresh the bearer token. Returns True on success.
 
-        ASSUMPTION: ``POST /refreshToken`` with ``{refresh_token}`` returns a
-        new token in the same envelope as login.
+        ``POST /refreshToken`` with ``{user_id, refresh_token}`` returns a new
+        ``token`` in the same envelope as login.
         """
         if not self._refresh_token:
             return False
@@ -260,10 +265,10 @@ class FlientApi:
                 "POST",
                 ENDPOINT_REFRESH,
                 json={
+                    "user_id": self._user_id,
                     "refresh_token": self._refresh_token,
-                    "refreshToken": self._refresh_token,
                 },
-                auth=False,
+                auth=True,  # the refresh call carries the (expired) bearer too
             )
         except FlientApiError:
             return False
@@ -273,18 +278,15 @@ class FlientApi:
         return bool(self._access_token)
 
     async def _ensure_token(self) -> None:
-        """Ensure we have a (probably) valid access token."""
-        if self._access_token and (
-            self._expires_at == 0.0 or time.time() < self._expires_at - 30
-        ):
+        """Ensure we have a bearer token, refreshing if we only have a refresh token."""
+        if self._access_token:
             return
-        if self._access_token and self._expires_at and await self._async_refresh():
+        if self._refresh_token and await self._async_refresh():
             return
-        # No token at all, or refresh failed: a fresh login is required. With
-        # 2FA this cannot be done silently, so surface it as an auth error and
-        # let Home Assistant trigger the reauth flow.
-        if not self._access_token:
-            raise FlientAuthError("Not authenticated; reauthentication required")
+        # No usable token: a fresh login is required. With 2FA this cannot be
+        # done silently, so surface it as an auth error and let Home Assistant
+        # trigger the reauth flow.
+        raise FlientAuthError("Not authenticated; reauthentication required")
 
     # --------------------------------------------------------------- queries
 
@@ -303,7 +305,12 @@ class FlientApi:
         return [self._normalize_lock(item) for item in raw_list or []]
 
     async def get_lock_state(self, lock_id: int) -> dict[str, Any]:
-        """Return normalized state + battery for a single lock."""
+        """Return the current open/closed state for a single lock.
+
+        ``POST /getOpenStateLock`` with ``{user_id, lock_id}`` returns the state
+        directly in the ``data`` field as an int (0 locked / 1 unlocked /
+        2 unknown). Battery is not returned here; it comes from the lock list.
+        """
         result: dict[str, Any] = {}
         payload = await self._request(
             "POST",
@@ -312,40 +319,14 @@ class FlientApi:
         )
         if _result_ok(payload):
             body = _data(payload)
+            # data is the state int itself; tolerate a wrapped {state: ...} too.
             state = _first(body, "state", "lockState") if isinstance(body, dict) else body
             if state is not None:
                 try:
                     result["state"] = int(state)
                 except (TypeError, ValueError):
                     pass
-
-        battery = await self._get_battery(lock_id)
-        if battery is not None:
-            result["battery_level"] = battery
         return result
-
-    async def _get_battery(self, lock_id: int) -> int | None:
-        """Return battery percentage for a lock, or None."""
-        try:
-            payload = await self._request(
-                "POST",
-                ENDPOINT_BATTERY,
-                data={"user_id": self._user_id, "lock_id": lock_id},
-            )
-        except FlientApiError:
-            return None
-        if not _result_ok(payload):
-            return None
-        body = _data(payload)
-        value = (
-            _first(body, "electricQuantity", "battery_level", "battery")
-            if isinstance(body, dict)
-            else body
-        )
-        try:
-            return int(value) if value is not None else None
-        except (TypeError, ValueError):
-            return None
 
     async def get_events(self, lock_id: int, page: int = 1) -> list[dict[str, Any]]:
         """Return recent lock records for a lock.
@@ -408,17 +389,30 @@ class FlientApi:
 
     @staticmethod
     def _normalize_lock(item: dict[str, Any]) -> dict[str, Any]:
-        """Map TTLock-style fields onto the names the integration expects."""
+        """Map the API's lock fields onto the names the integration expects.
+
+        Confirmed fields from /getLockList: lock_id, lock_name, lock_type,
+        lock_state, battery_percentage, mac_or_id (all values are strings).
+        """
         if not isinstance(item, dict):
             return {}
+
+        def as_int(value: Any) -> Any:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return value
+
         return {
-            "lock_id": _first(item, "lockId", "lock_id", "id"),
-            "lock_name": _first(item, "lockAlias", "lockName", "lock_name", "name"),
-            "lock_model": _first(item, "lockModel", "modelNum", "lock_model"),
-            "state": _first(item, "state", "lockState"),
-            "battery_level": _first(item, "electricQuantity", "battery_level"),
-            "auto_lock_time": _first(item, "autoLockTime", "auto_lock_time"),
-            "gateway_id": _first(item, "gatewayId", "gateway_id"),
+            "lock_id": as_int(_first(item, "lock_id", "lockId", "id")),
+            "lock_name": _first(item, "lock_name", "lockAlias", "lockName", "name"),
+            "lock_model": _first(item, "lock_type", "lock_variant", "lockModel"),
+            "state": as_int(_first(item, "lock_state", "state", "lockState")),
+            "battery_level": as_int(
+                _first(item, "battery_percentage", "electricQuantity", "battery_level")
+            ),
+            "mac": _first(item, "mac_or_id", "lockMac"),
+            "door_state": _first(item, "door_state"),
             "_raw": item,
         }
 

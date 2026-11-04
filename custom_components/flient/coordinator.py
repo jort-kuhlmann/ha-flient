@@ -30,25 +30,17 @@ class FlientCoordinator(DataUpdateCoordinator[dict[int, dict[str, Any]]]):
         self._locks_loaded = False
 
     async def _async_update_data(self) -> dict[int, dict[str, Any]]:
-        """Fetch the lock list once, then poll per-lock state each cycle."""
+        """Refresh all locks each cycle (state + battery come from getLockList)."""
         try:
-            data: dict[int, dict[str, Any]] = dict(self.data or {})
-
-            if not self._locks_loaded or not data:
-                data = {}
-                for lock in await self.api.get_locks():
-                    lock_id = lock.get("lock_id")
-                    if lock_id is None:
-                        continue
-                    data[lock_id] = lock
-                self._locks_loaded = True
-
-            # Poll current state + battery for each known lock.
-            for lock_id in list(data):
-                state = await self.api.get_lock_state(lock_id)
-                if state:
-                    data[lock_id].update(state)
-
+            # getLockList returns lock_state and battery_percentage for every
+            # lock in one call, so refresh the whole set each cycle.
+            data: dict[int, dict[str, Any]] = {}
+            for lock in await self.api.get_locks():
+                lock_id = lock.get("lock_id")
+                if lock_id is None:
+                    continue
+                data[lock_id] = lock
+            self._locks_loaded = True
             return data
 
         except FlientAuthError as err:
