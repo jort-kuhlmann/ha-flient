@@ -98,8 +98,13 @@ def _message(payload: dict[str, Any]) -> str:
 
 
 def _data(payload: dict[str, Any]) -> Any:
-    """Return the data body of an envelope, tolerating casing variants."""
-    return _first(payload, "data", "Data", "Result") or {}
+    """Return the data body of an envelope, tolerating casing variants.
+
+    Must not use ``or {}`` here: ``getOpenStateLock`` returns ``data: 0`` for a
+    LOCKED lock, and ``0`` is falsy, so ``or {}`` would discard a valid state.
+    """
+    value = _first(payload, "data", "Data", "Result")
+    return value if value is not None else {}
 
 
 # Keys whose values must never reach the log (credentials/tokens/OTP).
