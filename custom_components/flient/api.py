@@ -203,16 +203,15 @@ class FlientApi:
     async def async_send_otp(self) -> None:
         """Ask the server to send a login OTP to the account.
 
-        ``POST /sendOTP`` with ``{email, emailOrPhone, phoneNo, password,
-        type}`` and ``type="login"`` (from the decompiled login flow). The app
-        sends this as multipart; the Laravel backend also reads JSON. Best
-        effort: a non-success envelope is logged, not raised, so the user can
-        still enter a code (or retry) if delivery is merely delayed.
+        ``POST /sendOTP`` with ``{email_or_phone, password, type}`` and
+        ``type="login"``. Field names and the required set were confirmed by
+        probing the server's validation messages (type, then password, then
+        email_or_phone). Best effort: a non-success envelope is logged, not
+        raised, so the user can still enter a code (or retry) if delivery is
+        merely delayed.
         """
         body = {
-            "email": self._email,
-            "emailOrPhone": self._email,
-            "phoneNo": "",
+            "email_or_phone": self._email,
             "password": self._password,
             "type": "login",
         }
