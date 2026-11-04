@@ -1,16 +1,23 @@
 """Flient API client for Home Assistant.
 
 The Flient backend is a white-label of the TTLock/Sciener cloud, reached at
-``https://api.flient.net/api``. The route names and field names used here were
-reverse-engineered from the Flient mobile app (a Flutter release build, so only
-the string table was available) plus live probing of the server.
+``https://api.flient.net/api`` (a Laravel app). The routes and request field
+names were recovered by decompiling the Flient mobile app (Flutter release AOT,
+via Blutter) and cross-checked against the server's validation responses:
 
-IMPORTANT: the exact success envelope, the login/OTP flow and the lock/unlock
-request parameters are ASSUMPTIONS and have not been verified against a real
-authenticated session. Each assumption is marked with ``ASSUMPTION:`` below.
-The parsing is written defensively (it accepts several field-name variants) so
-that small differences degrade gracefully, but a traffic capture of a real
-login + unlock is still needed to confirm this works end to end.
+- login:              POST /login  {email_or_phone, password, otp}
+- token refresh:      POST /refreshToken  {refresh_token}
+- list locks:         POST /getLockList  {user_id}
+- lock state:         POST /getOpenStateLock  {user_id, lock_id}
+- battery:            POST /lock/queryElectricQuantity  {user_id, lock_id}
+- records:            POST /getLockRecordList  {user_id, lock_id, page}
+- lock/unlock (hub):  POST /gatewayLockUnlock  {user_id, lock_id, type}
+                      where type is "lock" | "unlock"
+
+Tokens come back as access_token/accessToken + refresh_token. Responses use a
+{ResponseCode, ResponseMsg, Result, data} envelope. Parsing stays defensive
+(accepts field-name variants) since the response bodies have not all been seen
+against a live authenticated session yet.
 """
 from __future__ import annotations
 
@@ -254,12 +261,13 @@ class FlientApi:
 
     async def get_locks(self) -> list[dict[str, Any]]:
         """Return all locks, normalized to the integration's field names."""
-        payload = await self._request("POST", ENDPOINT_LOCK_LIST, data={})
+        payload = await self._request(
+            "POST", ENDPOINT_LOCK_LIST, data={"user_id": self._user_id}
+        )
         if not _result_ok(payload):
             raise FlientApiError(_message(payload))
         body = _data(payload)
-        # ASSUMPTION: the list may be the data body itself or nested under
-        # "list"/"locks".
+        # The list may be the data body itself or nested under "list"/"locks".
         raw_list = body
         if isinstance(body, dict):
             raw_list = _first(body, "list", "locks", "data") or []
@@ -269,7 +277,9 @@ class FlientApi:
         """Return normalized state + battery for a single lock."""
         result: dict[str, Any] = {}
         payload = await self._request(
-            "POST", ENDPOINT_LOCK_STATE, data={"lockId": lock_id}
+            "POST",
+            ENDPOINT_LOCK_STATE,
+            data={"user_id": self._user_id, "lock_id": lock_id},
         )
         if _result_ok(payload):
             body = _data(payload)
@@ -289,7 +299,9 @@ class FlientApi:
         """Return battery percentage for a lock, or None."""
         try:
             payload = await self._request(
-                "POST", ENDPOINT_BATTERY, data={"lockId": lock_id}
+                "POST",
+                ENDPOINT_BATTERY,
+                data={"user_id": self._user_id, "lock_id": lock_id},
             )
         except FlientApiError:
             return None
@@ -306,17 +318,18 @@ class FlientApi:
         except (TypeError, ValueError):
             return None
 
-    async def get_events(self, since: int = 60) -> list[dict[str, Any]]:
-        """Return recent lock records.
+    async def get_events(self, lock_id: int, page: int = 1) -> list[dict[str, Any]]:
+        """Return recent lock records for a lock.
 
-        ASSUMPTION: ``POST /getLockRecordList``. The parameters for time
-        filtering are unknown, so we fetch the latest page and let the
-        coordinator diff. Returns [] on any problem rather than raising, since
-        events are a best-effort enhancement.
+        ``POST /getLockRecordList`` with ``{user_id, lock_id, page}``. Returns []
+        on any problem rather than raising, since events are a best-effort
+        enhancement (the coordinator polls state directly for lock status).
         """
         try:
             payload = await self._request(
-                "POST", ENDPOINT_RECORDS, data={"pageNo": 1, "pageSize": 20}
+                "POST",
+                ENDPOINT_RECORDS,
+                data={"user_id": self._user_id, "lock_id": lock_id, "page": page},
             )
         except FlientApiError:
             return []
@@ -332,30 +345,30 @@ class FlientApi:
 
     async def lock(self, lock_id: int) -> bool:
         """Lock via the gateway (cloud) path."""
-        return await self._lock_action(lock_id, STATE_LOCKED)
+        return await self._lock_action(lock_id, "lock")
 
     async def unlock(self, lock_id: int) -> bool:
         """Unlock via the gateway (cloud) path."""
-        return await self._lock_action(lock_id, STATE_UNLOCKED)
+        return await self._lock_action(lock_id, "unlock")
 
-    async def _lock_action(self, lock_id: int, target_state: int) -> bool:
+    async def _lock_action(self, lock_id: int, action: str) -> bool:
         """Lock or unlock a lock through its gateway.
 
-        ASSUMPTION: ``POST /gatewayLockUnlock`` with ``{lockId, action}`` where
-        action is 0 (lock) / 1 (unlock), matching the TTLock state convention.
-        Alternatives the app references: a ``type`` field, or a separate
-        ``lockUnlock`` route. Sent redundantly to improve the odds.
+        ``POST /gatewayLockUnlock`` with ``{user_id, lock_id, type}`` where
+        ``type`` is the string ``"lock"`` or ``"unlock"``. The app sends this as
+        multipart form data; the Laravel backend also reads JSON, so we send
+        JSON for consistency with the other calls.
         """
         body = {
-            "lockId": lock_id,
-            "action": target_state,
-            "type": target_state,
+            "user_id": self._user_id,
+            "lock_id": lock_id,
+            "type": action,
         }
         payload = await self._request("POST", ENDPOINT_GATEWAY_UNLOCK, data=body)
         if not _result_ok(payload):
             _LOGGER.error(
                 "Gateway %s failed for lock %s: %s",
-                "unlock" if target_state == STATE_UNLOCKED else "lock",
+                action,
                 lock_id,
                 _message(payload),
             )
